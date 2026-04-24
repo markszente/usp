@@ -521,7 +521,9 @@ void rp_callback( radio_planner_t* rp )
             // the arbiter
             rp->radio_is_free = false;  // this is a kind of critical section
             rp_task_free( rp, &rp->tasks[rp->radio_task_id] );
+#ifndef USP_KEEP_XOSC_BETWEEN_TASKS
             SMTC_MODEM_HAL_PANIC_ON_FAILURE( ral_set_sleep( TARGET_RAL, true ) == RAL_STATUS_OK );
+#endif
             rp->radio = TARGET_RADIO;
 
             rp_hook_callback( rp, rp->radio_task_id );
@@ -534,11 +536,13 @@ void rp_callback( radio_planner_t* rp )
         {
             // A radio irq happened and no rp task is on going, put radio to sleep
             // even in case multiple radio put only main radio in sleep
+#ifndef USP_KEEP_XOSC_BETWEEN_TASKS
             for( int i = 0; i < RP_NB_HOOKS; i++ )
             {
                 SMTC_MODEM_HAL_PANIC_ON_FAILURE(
                     ral_set_sleep( &( rp->radio_target_attached_to_this_hook[i]->ral ), true ) == RAL_STATUS_OK );
             }
+#endif
             SMTC_MODEM_HAL_TRACE_PRINTF( " radio planner it but no more task activated\n" );
         }
 
