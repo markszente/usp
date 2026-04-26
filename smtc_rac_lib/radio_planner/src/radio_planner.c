@@ -1326,18 +1326,23 @@ static void rp_consumption_statistics_updated( radio_planner_t* rp, const uint8_
 
     // TODO RP_TASK_TYPE_CAD_TO_TX, RP_TASK_TYPE_USER, RP_TASK_TYPE_NONE,
 
+    /* Power-consumption accounting only: the upstream version called
+     * ral_cfg_rx_boosted() below, which writes register 0x08AC and
+     * silently clobbered the receiver to power-saving gain (0x94) after
+     * every successful RX. Configuration of Rx boost belongs to setup
+     * paths / the BSP, not this stats hook — never write to the chip
+     * from here.
+     */
     if( ( rp->tasks[hook_id].type == RP_TASK_TYPE_RX_LORA ) || ( rp->tasks[hook_id].type == RP_TASK_TYPE_CAD ) ||
         ( rp->tasks[hook_id].type == RP_TASK_TYPE_CAD_TO_RX ) )
     {
         bool enable_boost_mode = false;
-        ral_cfg_rx_boosted( TARGET_RAL_FOR_HOOK_ID, enable_boost_mode );
         ral_get_lora_rx_consumption_in_ua( TARGET_RAL_FOR_HOOK_ID, rp->radio_params[hook_id].rx.lora.mod_params.bw,
                                            enable_boost_mode, &micro_ampere_radio );
     }
     else if( ( rp->tasks[hook_id].type == RP_TASK_TYPE_RX_FSK ) || ( rp->tasks[hook_id].type == RP_TASK_TYPE_LBT ) )
     {
         bool enable_boost_mode = false;
-        ral_cfg_rx_boosted( TARGET_RAL_FOR_HOOK_ID, enable_boost_mode );
         ral_get_gfsk_rx_consumption_in_ua(
             TARGET_RAL_FOR_HOOK_ID, rp->radio_params[hook_id].rx.gfsk.mod_params.br_in_bps,
             rp->radio_params[hook_id].rx.gfsk.mod_params.bw_dsb_in_hz, enable_boost_mode, &micro_ampere_radio );
