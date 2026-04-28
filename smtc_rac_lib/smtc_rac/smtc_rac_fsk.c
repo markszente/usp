@@ -141,6 +141,188 @@
 static const uint8_t default_fsk_sync_word[] = SMTC_RAC_FSK_DEFAULT_SYNC_WORD;
 
 /*
+ * --- Chip-state cache (TX/RX setup short-circuit) -----------------------------
+ *
+ * Most field-by-field SPI commands issued from {tx,rx}_callback are
+ * redundant under the typical "single PHY, RX continuous, occasional
+ * TX" workload — every successful packet (RX_DONE or TX_DONE) leads
+ * the planner to free the task and re-launch a new one with the same
+ * params. ralf_setup_gfsk re-issues 9 commands. Each command costs at
+ * least one BUSY-wait quantum (~100 us on Zephyr tickless), so the
+ * full rebuild adds ~1 ms host-side latency on every re-arm even when
+ * nothing changed.
+ *
+ * Cache the last-programmed params here and skip setters whose
+ * arguments haven't changed since the last call. Same chip, same
+ * planner thread → no concurrency. If the host re-issues a setup that
+ * actually IS different (e.g. PHY change, TX↔RX with different
+ * pld_len_in_bytes), the differing field still goes out.
+ *
+ * Invalidate by calling smtc_rac_fsk_chip_cache_invalidate() — done
+ * automatically on PHY change via smtc_rac_radio_fsk_params_t writes
+ * isn't possible here without coupling, so external code that mutates
+ * the chip outside of this module (e.g. a direct ral_* poke from the
+ * BSP) must call the invalidate hook itself.
+ */
+struct fsk_chip_cache {
+    bool                                    valid;
+    bool                                    irq_mask_valid;
+    /* Last gfsk params we programmed. */
+    uint32_t                                rf_freq_in_hz;
+    int8_t                                  output_pwr_in_dbm;
+    bool                                    pkt_type_set;        /* set_pkt_type(GFSK) issued */
+    bool                                    stop_timer_set;
+    bool                                    timer_stop_on_preamble;
+    ral_gfsk_mod_params_t                   mod_params;
+    ral_gfsk_pkt_params_t                   pkt_params;
+    bool                                    crc_params_valid;
+    uint32_t                                crc_seed;
+    uint32_t                                crc_polynomial;
+    uint8_t                                 sync_word[8];
+    uint8_t                                 sync_word_len_bytes;
+    bool                                    whitening_valid;
+    uint16_t                                whitening_seed;
+    /* Last DIO IRQ mask. */
+    ral_irq_t                               irq_mask;
+};
+
+static struct fsk_chip_cache g_fsk_cache;
+
+/* Public: drop the cache so the next setup goes back through the full
+ * path. Call this after anything that bypasses the rac_fsk callbacks
+ * to touch the chip directly (BSP pokes, direct ral_set_*). Today the
+ * app's apply_phy_preset path goes through smtc_rac_fsk_set_*_params
+ * which then re-runs ralf_setup_gfsk via the callback, so the cache
+ * naturally re-validates with the new fields without an explicit
+ * invalidate. */
+void smtc_rac_fsk_chip_cache_invalidate( void )
+{
+    memset( &g_fsk_cache, 0, sizeof( g_fsk_cache ) );
+}
+
+/* Replacement for ralf_setup_gfsk that compares against g_fsk_cache
+ * and only issues SPI commands for fields that actually changed.
+ * Returns RAL_STATUS_OK if all (issued) commands succeeded. */
+static ral_status_t smart_setup_gfsk( const ralf_t* radio,
+                                      const ralf_params_gfsk_t* params )
+{
+    ral_status_t status;
+
+    /* StopTimerOnPreamble: ralf_setup_gfsk always calls with false. */
+    if( !g_fsk_cache.valid || !g_fsk_cache.stop_timer_set ||
+        g_fsk_cache.timer_stop_on_preamble != false )
+    {
+        status = ral_stop_timer_on_preamble( &radio->ral, false );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.stop_timer_set = true;
+        g_fsk_cache.timer_stop_on_preamble = false;
+    }
+
+    if( !g_fsk_cache.valid || !g_fsk_cache.pkt_type_set )
+    {
+        status = ral_set_pkt_type( &radio->ral, RAL_PKT_TYPE_GFSK );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.pkt_type_set = true;
+    }
+
+    if( !g_fsk_cache.valid || g_fsk_cache.rf_freq_in_hz != params->rf_freq_in_hz )
+    {
+        status = ral_set_rf_freq( &radio->ral, params->rf_freq_in_hz );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.rf_freq_in_hz = params->rf_freq_in_hz;
+    }
+
+    /* set_tx_cfg programs PA + tx params; cheap to skip on RX re-arm
+     * but the upstream ralf_setup_gfsk also runs it for RX setups, so
+     * we keep the behaviour identical. Comparison is on power+freq;
+     * BSP-derived PA params are deterministic from those. */
+    if( !g_fsk_cache.valid ||
+        g_fsk_cache.output_pwr_in_dbm != params->output_pwr_in_dbm ||
+        g_fsk_cache.rf_freq_in_hz != params->rf_freq_in_hz )
+    {
+        status = ral_set_tx_cfg( &radio->ral, params->output_pwr_in_dbm, params->rf_freq_in_hz );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.output_pwr_in_dbm = params->output_pwr_in_dbm;
+    }
+
+    if( !g_fsk_cache.valid ||
+        memcmp( &g_fsk_cache.mod_params, &params->mod_params, sizeof( ral_gfsk_mod_params_t ) ) != 0 )
+    {
+        status = ral_set_gfsk_mod_params( &radio->ral, &params->mod_params );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.mod_params = params->mod_params;
+    }
+
+    if( !g_fsk_cache.valid ||
+        memcmp( &g_fsk_cache.pkt_params, &params->pkt_params, sizeof( ral_gfsk_pkt_params_t ) ) != 0 )
+    {
+        status = ral_set_gfsk_pkt_params( &radio->ral, &params->pkt_params );
+        if( status != RAL_STATUS_OK ) return status;
+        g_fsk_cache.pkt_params = params->pkt_params;
+    }
+
+    if( params->pkt_params.crc_type != RAL_GFSK_CRC_OFF )
+    {
+        if( !g_fsk_cache.valid || !g_fsk_cache.crc_params_valid ||
+            g_fsk_cache.crc_seed != params->crc_seed ||
+            g_fsk_cache.crc_polynomial != params->crc_polynomial )
+        {
+            status = ral_set_gfsk_crc_params( &radio->ral, params->crc_seed, params->crc_polynomial );
+            if( status != RAL_STATUS_OK ) return status;
+            g_fsk_cache.crc_seed = params->crc_seed;
+            g_fsk_cache.crc_polynomial = params->crc_polynomial;
+            g_fsk_cache.crc_params_valid = true;
+        }
+    }
+
+    {
+        uint8_t sync_len_bytes = ( params->pkt_params.sync_word_len_in_bits + 7 ) / 8;
+        if( sync_len_bytes > sizeof( g_fsk_cache.sync_word ) )
+        {
+            sync_len_bytes = sizeof( g_fsk_cache.sync_word );
+        }
+        if( !g_fsk_cache.valid ||
+            g_fsk_cache.sync_word_len_bytes != sync_len_bytes ||
+            memcmp( g_fsk_cache.sync_word, params->sync_word, sync_len_bytes ) != 0 )
+        {
+            status = ral_set_gfsk_sync_word( &radio->ral, params->sync_word, sync_len_bytes );
+            if( status != RAL_STATUS_OK ) return status;
+            memcpy( g_fsk_cache.sync_word, params->sync_word, sync_len_bytes );
+            g_fsk_cache.sync_word_len_bytes = sync_len_bytes;
+        }
+    }
+
+    if( params->pkt_params.dc_free != RAL_GFSK_DC_FREE_OFF )
+    {
+        if( !g_fsk_cache.valid || !g_fsk_cache.whitening_valid ||
+            g_fsk_cache.whitening_seed != params->whitening_seed )
+        {
+            status = ral_set_gfsk_whitening_seed( &radio->ral, params->whitening_seed );
+            if( status != RAL_STATUS_OK ) return status;
+            g_fsk_cache.whitening_seed = params->whitening_seed;
+            g_fsk_cache.whitening_valid = true;
+        }
+    }
+
+    g_fsk_cache.valid = true;
+    return RAL_STATUS_OK;
+}
+
+/* Same idea for the DIO IRQ mask — TX and RX use different masks. */
+static ral_status_t smart_set_dio_irq( const ralf_t* radio, ral_irq_t mask )
+{
+    if( g_fsk_cache.irq_mask_valid && g_fsk_cache.irq_mask == mask )
+    {
+        return RAL_STATUS_OK;
+    }
+    ral_status_t status = ral_set_dio_irq_params( &radio->ral, mask );
+    if( status != RAL_STATUS_OK ) return status;
+    g_fsk_cache.irq_mask = mask;
+    g_fsk_cache.irq_mask_valid = true;
+    return RAL_STATUS_OK;
+}
+
+/*
  * -----------------------------------------------------------------------------
  * --- PRIVATE FUNCTIONS DECLARATION -------------------------------------------
  */
@@ -344,8 +526,8 @@ static void smtc_rac_fsk_tx_callback( void* rp_void )
             RAC_LOG_INFO( "LBT: Channel is free, continuing transmission" );
         }
     }
-    SMTC_MODEM_HAL_PANIC_ON_FAILURE( ralf_setup_gfsk( rp->radio, &rp->radio_params[id].tx.gfsk ) == RAL_STATUS_OK );
-    SMTC_MODEM_HAL_PANIC_ON_FAILURE( ral_set_dio_irq_params( &( rp->radio->ral ), RAL_IRQ_TX_DONE ) == RAL_STATUS_OK );
+    SMTC_MODEM_HAL_PANIC_ON_FAILURE( smart_setup_gfsk( rp->radio, &rp->radio_params[id].tx.gfsk ) == RAL_STATUS_OK );
+    SMTC_MODEM_HAL_PANIC_ON_FAILURE( smart_set_dio_irq( rp->radio, RAL_IRQ_TX_DONE ) == RAL_STATUS_OK );
 
     SMTC_MODEM_HAL_PANIC_ON_FAILURE(
         ral_set_pkt_payload( &( rp->radio->ral ), rp->payload[id], rp->payload_buffer_size[id] ) == RAL_STATUS_OK );
@@ -399,10 +581,10 @@ static void smtc_rac_fsk_rx_callback( void* rp_void )
     uint8_t             id           = rp->radio_task_id;
     rp_radio_params_t*  radio_params = &rp->radio_params[id];
     smtc_rac_context_t* rac_config   = smtc_rac_get_context( id );
-    SMTC_MODEM_HAL_PANIC_ON_FAILURE( ralf_setup_gfsk( rp->radio, &radio_params->rx.gfsk ) == RAL_STATUS_OK );
+    SMTC_MODEM_HAL_PANIC_ON_FAILURE( smart_setup_gfsk( rp->radio, &radio_params->rx.gfsk ) == RAL_STATUS_OK );
     SMTC_MODEM_HAL_PANIC_ON_FAILURE(
-        ral_set_dio_irq_params( &( rp->radio->ral ), RAL_IRQ_RX_DONE | RAL_IRQ_RX_TIMEOUT | RAL_IRQ_RX_HDR_ERROR |
-                                                         RAL_IRQ_RX_CRC_ERROR ) == RAL_STATUS_OK );
+        smart_set_dio_irq( rp->radio, RAL_IRQ_RX_DONE | RAL_IRQ_RX_TIMEOUT | RAL_IRQ_RX_HDR_ERROR |
+                                          RAL_IRQ_RX_CRC_ERROR ) == RAL_STATUS_OK );
 
     // Wait the exact expected time (ie target - tcxo startup delay)
     smtc_rac_context_t* rac_context = smtc_rac_get_context( id );
